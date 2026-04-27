@@ -52,16 +52,16 @@ class Mlp(nn.Module):
         out_features: Number of output features (optional)
         bias: Whether to include bias in the linear layers
     """
-    def __init__(self, 
-            in_features: int, 
-            hidden_features: Optional[int] = None, 
-            out_features: Optional[int] = None, 
+    def __init__(self,
+            in_features: int,
+            hidden_features: Optional[int] = None,
+            out_features: Optional[int] = None,
             bias: bool = False,
         ):
         super().__init__()
         out_features = out_features or in_features
         hidden_features = hidden_features or in_features
-        
+
         self.fc1 = nn.Linear(in_features, hidden_features, bias=bias)
         self.act = nn.GELU()
         self.fc2 = nn.Linear(hidden_features, out_features, bias=bias)
@@ -71,6 +71,40 @@ class Mlp(nn.Module):
         x = self.act(x)
         x = self.fc2(x)
         return x
+
+
+class SwiGLU(nn.Module):
+    """
+    SwiGLU feed-forward block as a drop-in replacement for Mlp.
+
+    Uses the gating mechanism: output = W3(SiLU(W1(x)) * W2(x))
+
+    To maintain roughly the same parameter count as Mlp with the same mlp_ratio,
+    Block and DecoderBlock automatically scale hidden_features by 2/3 when
+    use_swiglu=True (since SwiGLU has two input projections instead of one).
+
+    Args:
+        in_features: Number of input features
+        hidden_features: Number of hidden features (optional)
+        out_features: Number of output features (optional)
+        bias: Whether to include bias in the linear layers
+    """
+    def __init__(self,
+            in_features: int,
+            hidden_features: Optional[int] = None,
+            out_features: Optional[int] = None,
+            bias: bool = False,
+        ):
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+
+        self.w1 = nn.Linear(in_features, hidden_features, bias=bias)  # gate projection
+        self.w2 = nn.Linear(in_features, hidden_features, bias=bias)  # value projection
+        self.w3 = nn.Linear(hidden_features, out_features, bias=bias)  # output projection
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.w3(F.silu(self.w1(x)) * self.w2(x))
 
 
 class Attention(nn.Module):
@@ -183,14 +217,18 @@ class Block(nn.Module):
         head_dim: Dimension of each attention head
         mlp_ratio: Ratio of MLP hidden dimension to transformer dimension
         use_bias: Whether to include bias in the QKV, attention output projection and MLP layers
+        use_swiglu: If True, use SwiGLU instead of Mlp. Hidden dim is scaled by 2/3 to keep
+            parameter count approximately equal to the standard Mlp.
     """
-    def __init__(self, dim: int, head_dim: int = 64, mlp_ratio: float = 4., use_bias: bool = False):
+    def __init__(self, dim: int, head_dim: int = 64, mlp_ratio: float = 4., use_bias: bool = False, use_swiglu: bool = False):
         super().__init__()
         self.norm1 = LayerNorm(dim, bias=use_bias)
         self.attn = Attention(dim, head_dim=head_dim, qkv_bias=use_bias, proj_bias=use_bias)
         self.norm2 = LayerNorm(dim, bias=use_bias)
-        mlp_hidden_dim = int(dim * mlp_ratio)
-        self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, bias=use_bias)
+        # Scale hidden dim by 2/3 for SwiGLU to keep param count ~equal (two input projections vs one)
+        mlp_hidden_dim = int(dim * mlp_ratio * (2 / 3 if use_swiglu else 1))
+        self.mlp = SwiGLU(in_features=dim, hidden_features=mlp_hidden_dim, bias=use_bias) if use_swiglu \
+            else Mlp(in_features=dim, hidden_features=mlp_hidden_dim, bias=use_bias)
 
     def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         x = x + self.attn(self.norm1(x), mask=mask)
@@ -200,7 +238,7 @@ class Block(nn.Module):
 
 class DecoderBlock(nn.Module):
     """
-    Basic transformer decoder block with a multi-head self-attention, 
+    Basic transformer decoder block with a multi-head self-attention,
     a multi-head cross-attention, and a feed-forward MLP layer.
 
     Args:
@@ -208,8 +246,10 @@ class DecoderBlock(nn.Module):
         head_dim: Dimension of each attention head
         mlp_ratio: Ratio of MLP hidden dimension to transformer dimension
         use_bias: Whether to include bias in the QKV, attention output projection and MLP layers
+        use_swiglu: If True, use SwiGLU instead of Mlp. Hidden dim is scaled by 2/3 to keep
+            parameter count approximately equal to the standard Mlp.
     """
-    def __init__(self, dim: int, head_dim: int = 64, mlp_ratio: float = 4., use_bias: bool = False):
+    def __init__(self, dim: int, head_dim: int = 64, mlp_ratio: float = 4., use_bias: bool = False, use_swiglu: bool = False):
         super().__init__()
         self.norm1 = LayerNorm(dim, bias=use_bias)
         self.query_norm = LayerNorm(dim, bias=use_bias)
@@ -219,8 +259,10 @@ class DecoderBlock(nn.Module):
         self.self_attn = Attention(dim, head_dim=head_dim, qkv_bias=use_bias, proj_bias=use_bias)
         self.cross_attn = CrossAttention(dim, head_dim=head_dim, qkv_bias=use_bias, proj_bias=use_bias)
 
-        mlp_hidden_dim = int(dim * mlp_ratio)
-        self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, bias=use_bias)
+        # Scale hidden dim by 2/3 for SwiGLU to keep param count ~equal (two input projections vs one)
+        mlp_hidden_dim = int(dim * mlp_ratio * (2 / 3 if use_swiglu else 1))
+        self.mlp = SwiGLU(in_features=dim, hidden_features=mlp_hidden_dim, bias=use_bias) if use_swiglu \
+            else Mlp(in_features=dim, hidden_features=mlp_hidden_dim, bias=use_bias)
 
     def forward(self, 
             x: torch.Tensor, 
@@ -248,6 +290,7 @@ class TransformerTrunk(nn.Module):
         head_dim: Dimension of each attention head
         mlp_ratio: Ratio of MLP hidden dimension to transformer dimension
         use_bias: Whether to include bias in the QKV, attention output projection and MLP layers
+        use_swiglu: If True, use SwiGLU instead of Mlp in each block.
     """
     def __init__(
         self,
@@ -256,11 +299,12 @@ class TransformerTrunk(nn.Module):
             head_dim: int = 64,
             mlp_ratio: float = 4.0,
             use_bias: bool = False,
+            use_swiglu: bool = False,
         ):
         super().__init__()
 
         self.blocks = nn.ModuleList([
-            Block(dim=dim, head_dim=head_dim, mlp_ratio=mlp_ratio, use_bias=use_bias)
+            Block(dim=dim, head_dim=head_dim, mlp_ratio=mlp_ratio, use_bias=use_bias, use_swiglu=use_swiglu)
             for _ in range(depth)
         ])
     
@@ -280,6 +324,7 @@ class TransformerDecoderTrunk(nn.Module):
         head_dim: Dimension of each attention head
         mlp_ratio: Ratio of MLP hidden dimension to transformer dimension
         use_bias: Whether to include bias in the QKV, attention output projection and MLP layers
+        use_swiglu: If True, use SwiGLU instead of Mlp in each block.
     """
     def __init__(
         self,
@@ -288,11 +333,12 @@ class TransformerDecoderTrunk(nn.Module):
             head_dim: int = 64,
             mlp_ratio: float = 4.0,
             use_bias: bool = False,
+            use_swiglu: bool = False,
         ):
         super().__init__()
 
         self.blocks = nn.ModuleList([
-            DecoderBlock(dim=dim, head_dim=head_dim, mlp_ratio=mlp_ratio, use_bias=use_bias)
+            DecoderBlock(dim=dim, head_dim=head_dim, mlp_ratio=mlp_ratio, use_bias=use_bias, use_swiglu=use_swiglu)
             for _ in range(depth)
         ])
     

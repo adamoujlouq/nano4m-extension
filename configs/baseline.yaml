@@ -1,0 +1,18 @@
+model:
+  dim: 512
+  enc_depth: 6
+  dec_depth: 6
+  head_dim: 64
+  mlp_ratio: 4.0
+  use_bias: false
+  use_swiglu: false
+
+training:
+  lr: 3.0e-4
+  weight_decay: 0.05
+  batch_size: 64
+  num_steps: 10000
+  warmup_steps: 500
+  grad_clip: 1.0
+  log_every: 100
+  save_every: 1000

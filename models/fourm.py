@@ -119,12 +119,12 @@ class FourM(nn.Module):
         self.enc_mod_emb = nn.Embedding(self.num_modalities, dim)
         self.dec_mod_emb = nn.Embedding(self.num_modalities, dim)
                 
-        # Initialize Transformer encoder and decoder trunks
+                # APRÈS
         self.encoder = TransformerTrunk(
-            dim=dim, depth=enc_depth, head_dim=head_dim, mlp_ratio=mlp_ratio, use_bias=use_bias
+            dim=dim, depth=enc_depth, head_dim=head_dim, mlp_ratio=mlp_ratio, use_bias=use_bias, use_swiglu=use_swiglu
         )
         self.decoder = TransformerDecoderTrunk(
-            dim=dim, depth=dec_depth, head_dim=head_dim, mlp_ratio=mlp_ratio, use_bias=use_bias
+            dim=dim, depth=dec_depth, head_dim=head_dim, mlp_ratio=mlp_ratio, use_bias=use_bias, use_swiglu=use_swiglu
         )
 
         # Initialize encoder -> decoder context projection

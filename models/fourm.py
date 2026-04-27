@@ -109,29 +109,33 @@ class FourM(nn.Module):
         self.per_modality_loss_avg = per_modality_loss_avg
 
         # Initialize encoder token embedding
-        self.enc_tok_emb = ??? # TODO: Define the input embedding layer using self.vocab_size
+        self.enc_tok_emb = nn.Embedding(self.vocab_size, dim)
 
         # Initialize positional embeddings of predefined maximum length that we re-use for different modalities
         pos_emb = build_1d_sincos_posemb(self.max_posemb_len, dim)
         self.register_buffer("pos_emb", pos_emb)
 
         # Initialize modality embeddings
-        self.enc_mod_emb = ??? # TODO: Define the encoder modality embedding layer using self.num_modalities
-        self.dec_mod_emb = ??? # TODO: Define the decoder modality embedding layer using self.num_modalities
+        self.enc_mod_emb = nn.Embedding(self.num_modalities, dim)
+        self.dec_mod_emb = nn.Embedding(self.num_modalities, dim)
                 
         # Initialize Transformer encoder and decoder trunks
-        self.encoder = ??? # TODO: Define the Transformer encoder trunk
-        self.decoder = ??? # TODO: Define the Transformer decoder trunk
+        self.encoder = TransformerTrunk(
+            dim=dim, depth=enc_depth, head_dim=head_dim, mlp_ratio=mlp_ratio, use_bias=use_bias
+        )
+        self.decoder = TransformerDecoderTrunk(
+            dim=dim, depth=dec_depth, head_dim=head_dim, mlp_ratio=mlp_ratio, use_bias=use_bias
+        )
 
         # Initialize encoder -> decoder context projection
-        self.dec_context_proj = ??? # TODO: Define the encoder -> decoder projection. This is simply a linear layer mapping dim -> dim.
+        self.dec_context_proj = nn.Linear(dim, dim)
 
         # Initialize decoder output projection
-        self.to_logits = ??? # TODO: Define the output projection layer using self.vocab_size
+        self.to_logits = nn.Linear(dim, self.vocab_size, bias=False)
 
         # Initialize norm layers
-        self.enc_norm = ??? # TODO: Define the encoder output layer normalization. Use the LayerNorm class defined in modeling/transformer_layers.py
-        self.dec_norm = ??? # TODO: Define the decoder output layer normalization. Use the LayerNorm class defined in modeling/transformer_layers.py
+        self.enc_norm = LayerNorm(dim)
+        self.dec_norm = LayerNorm(dim)
 
         # Weight initialization
         self.init_std = init_std
@@ -195,27 +199,24 @@ class FourM(nn.Module):
         """
         B, N = enc_input_tokens.shape
 
-        # TODO: Embed the input tokens `enc_input_tokens` using the input embedding layer `enc_tok_emb`. Shape: [B, N, D]
-        x = ???
+        # Embed input tokens: [B, N, D]
+        x = self.enc_tok_emb(enc_input_tokens)
 
-        # TODO: Embed the input modality IDs `enc_input_modalities` using the input embedding layer `enc_mod_emb`. Shape: [B, N, D]
-        # Sum the modality embeddings to the token embeddings.
-        x = x + ???
+        # Add modality embeddings: [B, N, D]
+        x = x + self.enc_mod_emb(enc_input_modalities)
 
-        # TODO: Get the positional embeddings for the input positions `enc_input_positions` and add them to the input tokens. Shape: [B, N, D]
-        # Sum the positional embeddings to the token embeddings.
-        enc_posembs = ???
-        x = x + ???
+        # Get positional embeddings for encoder input positions: [B, N, D]
+        enc_posembs = self.pos_emb[enc_input_positions]  # [B, N, D]
+        x = x + enc_posembs
 
         # Construct (B, N, N) attention mask for padding. True = used, False = masked out.
         enc_pad_attn_mask = repeat(enc_pad_mask, 'b n -> b m n', m=N) if enc_pad_mask is not None else None
 
-        # TODO: Forward pass through the Transformer encoder. Shape [B, N, D]
-        # Hint: Don't forget to pass the encoder attention mask `enc_pad_attn_mask`.
-        x = ???
+        # Forward pass through the Transformer encoder: [B, N, D]
+        x = self.encoder(x, mask=enc_pad_attn_mask)
 
-        # TODO: Pass to the encoder output normalization layer
-        x = ???
+        # Encoder output normalization
+        x = self.enc_norm(x)
 
         return x, enc_posembs
 
@@ -249,30 +250,28 @@ class FourM(nn.Module):
         B, M = dec_input_modalities.shape
         _, N, _ = enc_context.shape
 
-        # TODO: Embed the target modality IDs `dec_input_modalities` using the embedding layer `dec_mod_emb`. Shape: [B, M, D]
-        x = ???
+        # Embed target modality IDs: [B, M, D]
+        x = self.dec_mod_emb(dec_input_modalities)
 
-        # TODO: Get the positional embeddings for the target positions `dec_input_positions` and add them to the tokens. Shape: [B, M, D]
-        # Sum the positional embeddings to the token embeddings.
-        x = x + ???
+        # Get positional embeddings for decoder target positions and add them: [B, M, D]
+        x = x + self.pos_emb[dec_input_positions]
 
         # Construct attention masks for padding. True = used, False = masked out.
         # [B, M, M] self-attention mask and [B, M, N] cross-attention mask
         dec_pad_sa_mask = repeat(dec_pad_mask, 'b m -> b n m', n=M) if dec_pad_mask is not None else None
         dec_pad_xa_mask = repeat(enc_pad_mask, 'b n -> b m n', m=M) if enc_pad_mask is not None else None
 
-        # TODO: Project context `enc_context` to the decoder dimension using `dec_context_proj`. Shape: [B, N, D] 
-        context = ???
+        # Project encoder context to decoder dimension: [B, N, D]
+        context = self.dec_context_proj(enc_context)
 
-        # Add the encoder positional embeddings `enc_posembs`. Shape: [B, N, D]
+        # Add encoder positional embeddings: [B, N, D]
         context = context + enc_posembs
 
-        # TODO: Pass through the Transformer decoder. Shape [B, M, D]
-        # Hint: Don't forget to pass the decoder self-attention mask `dec_pad_sa_mask` and the cross-attention mask `dec_pad_xa_mask`.
-        x = ???
+        # Forward pass through the Transformer decoder: [B, M, D]
+        x = self.decoder(x, context, sa_mask=dec_pad_sa_mask, xa_mask=dec_pad_xa_mask)
 
-        # TODO: Pass to the decoder output normalization layer
-        x = ???
+        # Decoder output normalization
+        x = self.dec_norm(x)
 
         return x
 
@@ -293,8 +292,8 @@ class FourM(nn.Module):
         # Decoder forward pass
         dec_x = self.forward_decoder(dec_input_modalities, dec_input_positions, enc_x, enc_posembs, enc_pad_mask, dec_pad_mask)
 
-        # TODO: Pass `dec_x` through linear output head `to_logits` to compute the logits. Shape: [B, M, vocab_size]
-        logits = ???
+        # Output head: [B, M, vocab_size]
+        logits = self.to_logits(dec_x)
 
         return logits
 
@@ -442,37 +441,39 @@ class FourM(nn.Module):
         # Get schedule for unmasking tokens
         schedule = self.get_unmasking_schedule(n_tokens_target, num_steps)
 
-        # TODO: There are n_tokens_target positions to predict, and we will unmask them in `num_steps` steps.
-        # The order in which we unmask the tokens is arbitrary, but here we will use a random order.
-        # That means, we will randomly shuffle the positions from 0 to n_tokens_target - 1, and then
-        # split them into `num_steps` steps. 
-        ???
-        # dec_input_positions_list is a list of position indices of shape (1, k) for each step. 
-        # Together, they should contain all the positions from 0 to n_tokens_target - 1 exactly once.
-        dec_input_positions_list = ???
+        # Randomly shuffle positions 0..n_tokens_target-1 and split into per-step chunks
+        shuffled_positions = torch.randperm(n_tokens_target, device=device)
+        dec_input_positions_list = []
+        idx = 0
+        for k in schedule:
+            positions = shuffled_positions[idx: idx + k].unsqueeze(0)  # [1, k]
+            dec_input_positions_list.append(positions)
+            idx += k
         
         for step, k in enumerate(schedule):
             # Select the k positions to predict for this step
-            dec_input_positions = dec_input_positions_list[step]
+            dec_input_positions = dec_input_positions_list[step]  # [1, k]
             # Create a tensor of k IDs specifying the target modality
             dec_input_modalities = target_mod_index * torch.ones(1, k, device=device, dtype=torch.long)
 
-            # TODO: Forward pass through the model to get the next tokens' logits. 
-            # Select the 0-th element to get shape: [k, vocab_size]
-            predicted_logits = ???
+            # Forward pass to get logits, select batch element 0: [k, vocab_size]
+            predicted_logits = self.forward_model(
+                enc_input_tokens=enc_input_tokens,
+                enc_input_modalities=enc_input_modalities,
+                enc_input_positions=enc_input_positions,
+                dec_input_modalities=dec_input_modalities,
+                dec_input_positions=dec_input_positions,
+            )[0]  # [k, vocab_size]
 
-            # TODO: Sample new tokens for the predicted_logits
-            # Hint: Use the sample_tokens function from utils/sampling.py
-            # Make sure to pass the `temp`, `top_k` and `top_p` arguments
-            samples, _ = ???
+            # Sample new tokens
+            samples, _ = sample_tokens(predicted_logits, temperature=temp, top_k=top_k, top_p=top_p)
+            # samples shape: [k], unsqueeze to [1, k]
+            samples = samples.unsqueeze(0)
 
-            # TODO: Concatenate the new tokens to the encoder input tokens for the next step
-            # Specifically, concatenate the k samples to enc_input_tokens, the k dec_input_positions
-            # to enc_input_positions, and the k dec_input_modalities to enc_input_modalities.
-            # The resulting shapes for each tensor should be [1, N_prev + k].
-            enc_input_tokens = ???
-            enc_input_positions = ???
-            enc_input_modalities = ???
+            # Concatenate new tokens to encoder inputs for the next step
+            enc_input_tokens = torch.cat([enc_input_tokens, samples], dim=1)
+            enc_input_positions = torch.cat([enc_input_positions, dec_input_positions], dim=1)
+            enc_input_modalities = torch.cat([enc_input_modalities, dec_input_modalities], dim=1)
                    
         # Select the predicted tokens for the target modality and unshuffle them
         pred_tokens = enc_input_tokens[enc_input_modalities == target_mod_index]

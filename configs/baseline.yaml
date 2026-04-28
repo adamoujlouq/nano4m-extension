@@ -16,3 +16,6 @@ training:
   grad_clip: 1.0
   log_every: 100
   save_every: 1000
+data:
+  root_dir: /work/com-304/datasets/clevr_com_304/
+  modalities: ["tok_rgb@256", "tok_depth@256", "tok_normal@256",

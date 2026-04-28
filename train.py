@@ -9,6 +9,8 @@ import torch
 import torch.optim as optim
 import yaml
 
+from data.multimodal import create_multimodal_masked_dataloader
+
 
 def set_seed(seed: int):
     random.seed(seed)
@@ -30,13 +32,37 @@ def get_cosine_lr(step: int, total_steps: int, warmup_steps: int, base_lr: float
     return base_lr * 0.5 * (1.0 + math.cos(math.pi * progress))
 
 
+def build_dataloader(cfg: dict, split: str):
+    dcfg = cfg["data"]
+    return create_multimodal_masked_dataloader(
+        root_dir=dcfg["root_dir"],
+        split=split,
+        modalities=dcfg["modalities"],
+        vocab_sizes=dcfg["vocab_sizes"],
+        max_seq_lens=dcfg["max_seq_lens"],
+        input_alphas=dcfg["input_alphas"],
+        target_alphas=dcfg["target_alphas"],
+        input_tokens_range=dcfg["input_tokens_range"],
+        target_tokens_range=dcfg["target_tokens_range"],
+        overlap_vocab=True,
+        overlap_posembs=True,
+        sample_from_k_augmentations=dcfg.get("sample_from_k_augmentations", 10),
+        text_tokenizer_path=dcfg.get("text_tokenizer_path", "gpt2"),
+        text_max_length=dcfg.get("text_max_length", 256),
+        batch_size=cfg["training"]["batch_size"],
+        infinite=True,
+        num_workers=4,
+        pin_memory=True,
+        shuffle=(split == "train"),
+        drop_last=(split == "train"),
+        distributed=False,
+    )
+
+
 def build_model(cfg: dict, device: torch.device):
     from models.fourm import FourM
 
-    modalities = ["rgb", "depth", "normals", "captions"]
-    vocab_sizes = [1024, 1024, 1024, 1024]
-    max_seq_lens = [196, 196, 196, 64]
-
+    dcfg = cfg["data"]
     model = FourM(
         enc_tokens_read_key="enc_tokens",
         dec_tokens_read_key="dec_tokens",
@@ -46,49 +72,12 @@ def build_model(cfg: dict, device: torch.device):
         dec_positions_read_key="dec_positions",
         enc_pad_mask_read_key="enc_pad_mask",
         dec_pad_mask_read_key="dec_pad_mask",
-        modalities=modalities,
-        vocab_sizes=vocab_sizes,
-        max_seq_lens=max_seq_lens,
+        modalities=dcfg["modalities"],
+        vocab_sizes=dcfg["vocab_sizes"],
+        max_seq_lens=dcfg["max_seq_lens"],
         **cfg["model"],
     )
     return model.to(device)
-
-
-def fake_batch(device: torch.device, batch_size: int = 4):
-    """
-    Génère un batch factice pour tester le training loop.
-    À remplacer par ton vrai DataLoader quand il sera prêt.
-    """
-    modalities = ["rgb", "depth", "normals", "captions"]
-    vocab_sizes = [1024, 1024, 1024, 1024]
-    max_seq_lens = [196, 196, 196, 64]
-
-    B = batch_size
-    enc_len = 128
-    dec_len = 64
-
-    num_mods = len(modalities)
-
-    enc_tokens = torch.randint(0, 1024, (B, enc_len), device=device)
-    enc_modalities = torch.randint(0, num_mods, (B, enc_len), device=device)
-    enc_positions = torch.arange(enc_len, device=device).unsqueeze(0).expand(B, -1)
-    enc_pad_mask = torch.ones(B, enc_len, dtype=torch.bool, device=device)
-
-    dec_tokens = torch.randint(0, 1024, (B, dec_len), device=device)
-    dec_modalities = torch.randint(0, num_mods, (B, dec_len), device=device)
-    dec_positions = torch.arange(dec_len, device=device).unsqueeze(0).expand(B, -1)
-    dec_pad_mask = torch.ones(B, dec_len, dtype=torch.bool, device=device)
-
-    return {
-        "enc_tokens": enc_tokens,
-        "enc_modalities": enc_modalities,
-        "enc_positions": enc_positions,
-        "enc_pad_mask": enc_pad_mask,
-        "dec_tokens": dec_tokens,
-        "dec_modalities": dec_modalities,
-        "dec_positions": dec_positions,
-        "dec_pad_mask": dec_pad_mask,
-    }
 
 
 def train(cfg: dict, seed: int, run_name: str):
@@ -107,14 +96,21 @@ def train(cfg: dict, seed: int, run_name: str):
     os.makedirs(f"results/{run_name}", exist_ok=True)
     log_path = f"results/{run_name}/metrics.jsonl"
 
+    # Build dataloaders
+    print("Building dataloaders...")
+    train_loader = build_dataloader(cfg, split="train")
+    val_loader = build_dataloader(cfg, split="val")
+
     model.train()
     for step in range(1, tcfg["num_steps"] + 1):
-        # Mise à jour du learning rate (cosine warmup)
+        # Learning rate update
         lr = get_cosine_lr(step, tcfg["num_steps"], tcfg["warmup_steps"], tcfg["lr"])
         for pg in optimizer.param_groups:
             pg["lr"] = lr
 
-        batch = fake_batch(device, batch_size=tcfg["batch_size"] // 16 or 4)
+        # Get next real batch
+        batch = next(train_loader)
+        batch = {k: v.to(device) for k, v in batch.items()}
 
         optimizer.zero_grad()
         loss, modality_losses = model(batch)
@@ -124,17 +120,25 @@ def train(cfg: dict, seed: int, run_name: str):
         optimizer.step()
 
         if step % tcfg["log_every"] == 0:
+            # Validation loss
+            model.eval()
+            with torch.no_grad():
+                val_batch = next(val_loader)
+                val_batch = {k: v.to(device) for k, v in val_batch.items()}
+                val_loss, val_modality_losses = model(val_batch)
+            model.train()
+
             log = {
                 "step": step,
-                "loss": loss.item(),
+                "train_loss": loss.item(),
+                "val_loss": val_loss.item(),
                 "lr": lr,
                 "grad_norm": grad_norm.item(),
-                **{f"val_loss_{k}": v.item() for k, v in modality_losses.items()},
+                **{f"train_loss_{k}": v.item() for k, v in modality_losses.items()},
+                **{f"val_loss_{k}": v.item() for k, v in val_modality_losses.items()},
             }
             print(
-                f"[{step:>6}] loss={loss.item():.4f} "
-                f"rgb={modality_losses.get('rgb', torch.tensor(0)).item():.4f} "
-                f"depth={modality_losses.get('depth', torch.tensor(0)).item():.4f} "
+                f"[{step:>6}] train={loss.item():.4f} val={val_loss.item():.4f} "
                 f"grad_norm={grad_norm.item():.4f} lr={lr:.2e}"
             )
             with open(log_path, "a") as f:

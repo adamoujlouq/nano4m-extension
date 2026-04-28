@@ -20,8 +20,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import repeat
 
-from nanofm.modeling.transformer_layers import TransformerTrunk, TransformerDecoderTrunk, LayerNorm
-from nanofm.utils.sampling import sample_tokens
+from modeling.transformer_layers import TransformerTrunk, TransformerDecoderTrunk, LayerNorm
 
 
 def build_1d_sincos_posemb(max_len, embed_dim=1024, temperature=10000.):
@@ -79,6 +78,7 @@ class FourM(nn.Module):
         vocab_sizes: List[int],
         max_seq_lens: List[int],
         dim: int = 512,
+        use_swiglu: bool = False,
         enc_depth: int = 8,
         dec_depth: int = 8,
         head_dim: int = 64,

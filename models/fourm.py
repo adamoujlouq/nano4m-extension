@@ -54,6 +54,9 @@ class FourM(nn.Module):
         vocab_sizes: List of vocabulary sizes for each modality
         max_seq_lens: List of maximum sequence lengths for each modality
         dim: Transformer dimension
+        use_swiglu: If True, replace GELU MLP blocks with SwiGLU blocks.
+        use_rope: If True, use RoPE in encoder/decoder self-attention only.
+        rope_base: Base frequency used by RoPE.
         enc_depth: Number of Transformer encoder layers
         dec_depth: Number of Transformer decoder layers
         head_dim: Dimension of each attention head
@@ -79,6 +82,8 @@ class FourM(nn.Module):
         max_seq_lens: List[int],
         dim: int = 512,
         use_swiglu: bool = False,
+        use_rope: bool = False,
+        rope_base: float = 10000.0,
         enc_depth: int = 8,
         dec_depth: int = 8,
         head_dim: int = 64,
@@ -107,6 +112,7 @@ class FourM(nn.Module):
         self.num_modalities = len(modalities)
         self.padding_idx = padding_idx
         self.per_modality_loss_avg = per_modality_loss_avg
+        self.use_rope = use_rope
 
         # Initialize encoder token embedding
         self.enc_tok_emb = nn.Embedding(self.vocab_size, dim)
@@ -118,13 +124,25 @@ class FourM(nn.Module):
         # Initialize modality embeddings
         self.enc_mod_emb = nn.Embedding(self.num_modalities, dim)
         self.dec_mod_emb = nn.Embedding(self.num_modalities, dim)
-                
-                # APRÈS
         self.encoder = TransformerTrunk(
-            dim=dim, depth=enc_depth, head_dim=head_dim, mlp_ratio=mlp_ratio, use_bias=use_bias, use_swiglu=use_swiglu
+            dim=dim,
+            depth=enc_depth,
+            head_dim=head_dim,
+            mlp_ratio=mlp_ratio,
+            use_bias=use_bias,
+            use_swiglu=use_swiglu,
+            use_rope=use_rope,
+            rope_base=rope_base,
         )
         self.decoder = TransformerDecoderTrunk(
-            dim=dim, depth=dec_depth, head_dim=head_dim, mlp_ratio=mlp_ratio, use_bias=use_bias, use_swiglu=use_swiglu
+            dim=dim,
+            depth=dec_depth,
+            head_dim=head_dim,
+            mlp_ratio=mlp_ratio,
+            use_bias=use_bias,
+            use_swiglu=use_swiglu,
+            use_rope=use_rope,
+            rope_base=rope_base,
         )
 
         # Initialize encoder -> decoder context projection
@@ -207,13 +225,18 @@ class FourM(nn.Module):
 
         # Get positional embeddings for encoder input positions: [B, N, D]
         enc_posembs = self.pos_emb[enc_input_positions]  # [B, N, D]
-        x = x + enc_posembs
+        if not self.use_rope:
+            x = x + enc_posembs
 
         # Construct (B, N, N) attention mask for padding. True = used, False = masked out.
         enc_pad_attn_mask = repeat(enc_pad_mask, 'b n -> b m n', m=N) if enc_pad_mask is not None else None
 
         # Forward pass through the Transformer encoder: [B, N, D]
-        x = self.encoder(x, mask=enc_pad_attn_mask)
+        x = self.encoder(
+            x,
+            mask=enc_pad_attn_mask,
+            positions=enc_input_positions if self.use_rope else None,
+        )
 
         # Encoder output normalization
         x = self.enc_norm(x)
@@ -254,7 +277,9 @@ class FourM(nn.Module):
         x = self.dec_mod_emb(dec_input_modalities)
 
         # Get positional embeddings for decoder target positions and add them: [B, M, D]
-        x = x + self.pos_emb[dec_input_positions]
+        dec_posembs = self.pos_emb[dec_input_positions]
+        if not self.use_rope:
+            x = x + dec_posembs
 
         # Construct attention masks for padding. True = used, False = masked out.
         # [B, M, M] self-attention mask and [B, M, N] cross-attention mask
@@ -264,11 +289,21 @@ class FourM(nn.Module):
         # Project encoder context to decoder dimension: [B, N, D]
         context = self.dec_context_proj(enc_context)
 
-        # Add encoder positional embeddings: [B, N, D]
-        context = context + enc_posembs
+        # Add encoder positional embeddings for the baseline path. With RoPE, self-attention
+        # uses rotary positions and cross-attention receives positions explicitly below.
+        if not self.use_rope:
+            context = context + enc_posembs
 
         # Forward pass through the Transformer decoder: [B, M, D]
-        x = self.decoder(x, context, sa_mask=dec_pad_sa_mask, xa_mask=dec_pad_xa_mask)
+        x = self.decoder(
+            x,
+            context,
+            sa_mask=dec_pad_sa_mask,
+            xa_mask=dec_pad_xa_mask,
+            self_positions=dec_input_positions if self.use_rope else None,
+            query_pos=dec_posembs if self.use_rope else None,
+            context_pos=enc_posembs if self.use_rope else None,
+        )
 
         # Decoder output normalization
         x = self.dec_norm(x)

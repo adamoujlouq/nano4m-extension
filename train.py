@@ -8,6 +8,7 @@ import numpy as np
 import torch
 import torch.optim as optim
 import yaml
+import wandb
 
 from data.multimodal import create_multimodal_masked_dataloader
 
@@ -89,6 +90,21 @@ def train(cfg: dict, seed: int, run_name: str):
     print(f"Params: {model.get_num_params() / 1e6:.1f}M")
 
     tcfg = cfg["training"]
+    wcfg = cfg.get("wandb", {})
+
+    # Init Wandb
+    wandb.init(
+        project=wcfg.get("project", "COM304_nano4M"),
+        entity=wcfg.get("entity", None),
+        name=run_name,
+        config={
+            "seed": seed,
+            "run_name": run_name,
+            **cfg["model"],
+            **tcfg,
+        },
+    )
+
     optimizer = optim.AdamW(
         model.parameters(), lr=tcfg["lr"], weight_decay=tcfg["weight_decay"]
     )
@@ -96,19 +112,16 @@ def train(cfg: dict, seed: int, run_name: str):
     os.makedirs(f"results/{run_name}", exist_ok=True)
     log_path = f"results/{run_name}/metrics.jsonl"
 
-    # Build dataloaders
     print("Building dataloaders...")
     train_loader = build_dataloader(cfg, split="train")
     val_loader = build_dataloader(cfg, split="val")
 
     model.train()
     for step in range(1, tcfg["num_steps"] + 1):
-        # Learning rate update
         lr = get_cosine_lr(step, tcfg["num_steps"], tcfg["warmup_steps"], tcfg["lr"])
         for pg in optimizer.param_groups:
             pg["lr"] = lr
 
-        # Get next real batch
         batch = next(train_loader)
         batch = {k: v.to(device) for k, v in batch.items()}
 
@@ -134,9 +147,13 @@ def train(cfg: dict, seed: int, run_name: str):
                 "val_loss": val_loss.item(),
                 "lr": lr,
                 "grad_norm": grad_norm.item(),
-                **{f"train_loss_{k}": v.item() for k, v in modality_losses.items()},
-                **{f"val_loss_{k}": v.item() for k, v in val_modality_losses.items()},
+                **{f"train/{k}": v.item() for k, v in modality_losses.items()},
+                **{f"val/{k}": v.item() for k, v in val_modality_losses.items()},
             }
+
+            # Log to Wandb
+            wandb.log(log, step=step)
+
             print(
                 f"[{step:>6}] train={loss.item():.4f} val={val_loss.item():.4f} "
                 f"grad_norm={grad_norm.item():.4f} lr={lr:.2e}"
@@ -149,6 +166,7 @@ def train(cfg: dict, seed: int, run_name: str):
             torch.save(model.state_dict(), ckpt_path)
             print(f"  → Checkpoint saved: {ckpt_path}")
 
+    wandb.finish()
     print(f"Training done. Logs: {log_path}")
 
 
@@ -162,7 +180,16 @@ if __name__ == "__main__":
     cfg = load_config(args.config)
 
     if args.run_name is None:
-        tag = "swiglu" if cfg["model"].get("use_swiglu") else "baseline"
+        enabled_arch_changes = [
+            name
+            for name, enabled in (
+                ("swiglu", cfg["model"].get("use_swiglu", False)),
+                ("rope", cfg["model"].get("use_rope", False)),
+                ("qknorm", cfg["model"].get("use_qk_norm", False)),
+            )
+            if enabled
+        ]
+        tag = "_".join(enabled_arch_changes) if enabled_arch_changes else "baseline"
         args.run_name = f"{tag}_seed{args.seed}"
 
     train(cfg, seed=args.seed, run_name=args.run_name)

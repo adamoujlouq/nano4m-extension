@@ -6,6 +6,8 @@ model:
   mlp_ratio: 4.0
   use_bias: false
   use_swiglu: false
+  use_rope: true
+  rope_base: 10000.0
 
 training:
   lr: 3.0e-4

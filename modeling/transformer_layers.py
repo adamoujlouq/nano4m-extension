@@ -17,11 +17,39 @@
 # https://github.com/apple/ml-4m
 # --------------------------------------------------------
 
-from typing import Optional
+from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
+
+
+def rotate_half(x: torch.Tensor) -> torch.Tensor:
+    """Rotate pairs of hidden dimensions for rotary position embeddings."""
+    x_even = x[..., ::2]
+    x_odd = x[..., 1::2]
+    return torch.stack((-x_odd, x_even), dim=-1).flatten(-2)
+
+
+def apply_rope(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        positions: torch.LongTensor,
+        base: float = 10000.0,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Apply RoPE to query/key tensors of shape [B, H, L, D]."""
+    head_dim = q.shape[-1]
+    if head_dim % 2 != 0:
+        raise ValueError(f"RoPE requires an even head dimension, got {head_dim}.")
+
+    inv_freq = 1.0 / (
+        base ** (torch.arange(0, head_dim, 2, device=q.device, dtype=torch.float32) / head_dim)
+    )
+    angles = positions.to(device=q.device, dtype=torch.float32)[..., None] * inv_freq
+    cos = torch.repeat_interleave(angles.cos(), 2, dim=-1).to(dtype=q.dtype)[:, None, :, :]
+    sin = torch.repeat_interleave(angles.sin(), 2, dim=-1).to(dtype=q.dtype)[:, None, :, :]
+
+    return (q * cos) + (rotate_half(q) * sin), (k * cos) + (rotate_half(k) * sin)
 
 
 class LayerNorm(nn.Module):
@@ -117,23 +145,43 @@ class Attention(nn.Module):
         qkv_bias: Whether to include bias in the QKV linear layers
         proj_bias: Whether to include bias in the attention output projection
     """
-    def __init__(self, dim: int, head_dim: int = 64, qkv_bias: bool = False, proj_bias: bool = False):
+    def __init__(
+            self,
+            dim: int,
+            head_dim: int = 64,
+            qkv_bias: bool = False,
+            proj_bias: bool = False,
+            use_rope: bool = False,
+            rope_base: float = 10000.0,
+        ):
         super().__init__()
         self.num_heads = dim // head_dim
         self.scale = head_dim ** -0.5
+        self.use_rope = use_rope
+        self.rope_base = rope_base
 
         # Single projection for Q, K, V (3x the dimension)
         self.qkv = nn.Linear(dim, 3 * dim, bias=qkv_bias)
 
         self.attn_out_proj = nn.Linear(dim, dim, bias=proj_bias)
 
-    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(
+            self,
+            x: torch.Tensor,
+            mask: Optional[torch.Tensor] = None,
+            positions: Optional[torch.LongTensor] = None,
+        ) -> torch.Tensor:
         B, L, D = x.shape # Batch size, sequence length, and dimension
 
         # Compute Q, K, V and reshape to [B, num_heads, L, head_dim]
         qkv = self.qkv(x)  # [B, L, 3*D]
         qkv = rearrange(qkv, "b l (three h d) -> three b h l d", three=3, h=self.num_heads)
         q, k, v = qkv.unbind(0)  # Each: [B, num_heads, L, head_dim]
+
+        if self.use_rope:
+            if positions is None:
+                raise ValueError("RoPE self-attention requires token positions.")
+            q, k = apply_rope(q, k, positions=positions, base=self.rope_base)
 
         # Attention matrix: [B, num_heads, L, L]
         attn = (q @ k.transpose(-2, -1)) * self.scale
@@ -220,18 +268,39 @@ class Block(nn.Module):
         use_swiglu: If True, use SwiGLU instead of Mlp. Hidden dim is scaled by 2/3 to keep
             parameter count approximately equal to the standard Mlp.
     """
-    def __init__(self, dim: int, head_dim: int = 64, mlp_ratio: float = 4., use_bias: bool = False, use_swiglu: bool = False):
+    def __init__(
+            self,
+            dim: int,
+            head_dim: int = 64,
+            mlp_ratio: float = 4.,
+            use_bias: bool = False,
+            use_swiglu: bool = False,
+            use_rope: bool = False,
+            rope_base: float = 10000.0,
+        ):
         super().__init__()
         self.norm1 = LayerNorm(dim, bias=use_bias)
-        self.attn = Attention(dim, head_dim=head_dim, qkv_bias=use_bias, proj_bias=use_bias)
+        self.attn = Attention(
+            dim,
+            head_dim=head_dim,
+            qkv_bias=use_bias,
+            proj_bias=use_bias,
+            use_rope=use_rope,
+            rope_base=rope_base,
+        )
         self.norm2 = LayerNorm(dim, bias=use_bias)
         # Scale hidden dim by 2/3 for SwiGLU to keep param count ~equal (two input projections vs one)
         mlp_hidden_dim = int(dim * mlp_ratio * (2 / 3 if use_swiglu else 1))
         self.mlp = SwiGLU(in_features=dim, hidden_features=mlp_hidden_dim, bias=use_bias) if use_swiglu \
             else Mlp(in_features=dim, hidden_features=mlp_hidden_dim, bias=use_bias)
 
-    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        x = x + self.attn(self.norm1(x), mask=mask)
+    def forward(
+            self,
+            x: torch.Tensor,
+            mask: Optional[torch.Tensor] = None,
+            positions: Optional[torch.LongTensor] = None,
+        ) -> torch.Tensor:
+        x = x + self.attn(self.norm1(x), mask=mask, positions=positions)
         x = x + self.mlp(self.norm2(x))
         return x
 
@@ -249,14 +318,30 @@ class DecoderBlock(nn.Module):
         use_swiglu: If True, use SwiGLU instead of Mlp. Hidden dim is scaled by 2/3 to keep
             parameter count approximately equal to the standard Mlp.
     """
-    def __init__(self, dim: int, head_dim: int = 64, mlp_ratio: float = 4., use_bias: bool = False, use_swiglu: bool = False):
+    def __init__(
+            self,
+            dim: int,
+            head_dim: int = 64,
+            mlp_ratio: float = 4.,
+            use_bias: bool = False,
+            use_swiglu: bool = False,
+            use_rope: bool = False,
+            rope_base: float = 10000.0,
+        ):
         super().__init__()
         self.norm1 = LayerNorm(dim, bias=use_bias)
         self.query_norm = LayerNorm(dim, bias=use_bias)
         self.context_norm = LayerNorm(dim, bias=use_bias)
         self.norm2 = LayerNorm(dim, bias=use_bias)
 
-        self.self_attn = Attention(dim, head_dim=head_dim, qkv_bias=use_bias, proj_bias=use_bias)
+        self.self_attn = Attention(
+            dim,
+            head_dim=head_dim,
+            qkv_bias=use_bias,
+            proj_bias=use_bias,
+            use_rope=use_rope,
+            rope_base=rope_base,
+        )
         self.cross_attn = CrossAttention(dim, head_dim=head_dim, qkv_bias=use_bias, proj_bias=use_bias)
 
         # Scale hidden dim by 2/3 for SwiGLU to keep param count ~equal (two input projections vs one)
@@ -269,12 +354,17 @@ class DecoderBlock(nn.Module):
             context: torch.Tensor, 
             sa_mask: Optional[torch.Tensor] = None, # Self-attention mask
             xa_mask: Optional[torch.Tensor] = None, # Cross-attention mask
+            self_positions: Optional[torch.LongTensor] = None,
+            query_pos: Optional[torch.Tensor] = None,
+            context_pos: Optional[torch.Tensor] = None,
         ) -> torch.Tensor:
 
         # Self-attention with residual
-        x = x + self.self_attn(self.norm1(x), mask=sa_mask)
+        x = x + self.self_attn(self.norm1(x), mask=sa_mask, positions=self_positions)
         # Cross-attention with residual
-        x = x + self.cross_attn(self.query_norm(x), self.context_norm(context), mask=xa_mask)
+        cross_query = x + query_pos if query_pos is not None else x
+        cross_context = context + context_pos if context_pos is not None else context
+        x = x + self.cross_attn(self.query_norm(cross_query), self.context_norm(cross_context), mask=xa_mask)
         # MLP with residual
         x = x + self.mlp(self.norm2(x))
         return x
@@ -300,17 +390,32 @@ class TransformerTrunk(nn.Module):
             mlp_ratio: float = 4.0,
             use_bias: bool = False,
             use_swiglu: bool = False,
+            use_rope: bool = False,
+            rope_base: float = 10000.0,
         ):
         super().__init__()
 
         self.blocks = nn.ModuleList([
-            Block(dim=dim, head_dim=head_dim, mlp_ratio=mlp_ratio, use_bias=use_bias, use_swiglu=use_swiglu)
+            Block(
+                dim=dim,
+                head_dim=head_dim,
+                mlp_ratio=mlp_ratio,
+                use_bias=use_bias,
+                use_swiglu=use_swiglu,
+                use_rope=use_rope,
+                rope_base=rope_base,
+            )
             for _ in range(depth)
         ])
     
-    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(
+            self,
+            x: torch.Tensor,
+            mask: Optional[torch.Tensor] = None,
+            positions: Optional[torch.LongTensor] = None,
+        ) -> torch.Tensor:
         for block in self.blocks:
-            x = block(x, mask=mask)
+            x = block(x, mask=mask, positions=positions)
         return x
 
 
@@ -334,11 +439,21 @@ class TransformerDecoderTrunk(nn.Module):
             mlp_ratio: float = 4.0,
             use_bias: bool = False,
             use_swiglu: bool = False,
+            use_rope: bool = False,
+            rope_base: float = 10000.0,
         ):
         super().__init__()
 
         self.blocks = nn.ModuleList([
-            DecoderBlock(dim=dim, head_dim=head_dim, mlp_ratio=mlp_ratio, use_bias=use_bias, use_swiglu=use_swiglu)
+            DecoderBlock(
+                dim=dim,
+                head_dim=head_dim,
+                mlp_ratio=mlp_ratio,
+                use_bias=use_bias,
+                use_swiglu=use_swiglu,
+                use_rope=use_rope,
+                rope_base=rope_base,
+            )
             for _ in range(depth)
         ])
     
@@ -348,8 +463,19 @@ class TransformerDecoderTrunk(nn.Module):
             context: torch.Tensor, 
             sa_mask: Optional[torch.Tensor] = None, # Self-attention mask
             xa_mask: Optional[torch.Tensor] = None, # Cross-attention mask
+            self_positions: Optional[torch.LongTensor] = None,
+            query_pos: Optional[torch.Tensor] = None,
+            context_pos: Optional[torch.Tensor] = None,
         ) -> torch.Tensor:
         
         for block in self.blocks:
-            x = block(x, context, sa_mask=sa_mask, xa_mask=xa_mask)
+            x = block(
+                x,
+                context,
+                sa_mask=sa_mask,
+                xa_mask=xa_mask,
+                self_positions=self_positions,
+                query_pos=query_pos,
+                context_pos=context_pos,
+            )
         return x

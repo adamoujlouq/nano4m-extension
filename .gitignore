@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+
+# Training checkpoints are too large for regular Git/GitHub pushes.
+*.pt
+*.pth
+*.ckpt

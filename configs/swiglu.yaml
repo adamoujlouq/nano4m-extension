@@ -29,3 +29,7 @@ data:
   sample_from_k_augmentations: 10
   text_tokenizer_path: gpt2
   text_max_length: 256
+
+wandb:
+  project: COM304_nano4M
+  entity: adam-oujlouq

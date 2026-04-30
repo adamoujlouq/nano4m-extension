@@ -31,5 +31,9 @@ data:
   text_max_length: 256
 
 wandb:
+  enabled: true
+  mode: online
   project: COM304_nano4M
   entity: adam-oujlouq
+  tags: ["swiglu", "week1"]
+  watch_model: false

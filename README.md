@@ -25,6 +25,23 @@ data:
 
 If you use a local copy of the dataset, edit `data.root_dir` in the config before launching.
 
+## W&B logging
+
+Training logs to Weights & Biases by default under:
+
+```text
+entity: adam-oujlouq
+project: COM304_nano4M
+```
+
+Before launching on a new machine, authenticate once:
+
+```bash
+wandb login
+```
+
+Each run prints its W&B URL at startup. The dashboard receives the global losses, per-modality losses, learning rate, and gradient norm, so curves are available live during training.
+
 ## Week 2: RoPE run
 
 RoPE is controlled by these model flags:

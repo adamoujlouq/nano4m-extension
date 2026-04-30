@@ -81,6 +81,46 @@ def build_model(cfg: dict, device: torch.device):
     return model.to(device)
 
 
+def init_wandb(cfg: dict, seed: int, run_name: str, model: torch.nn.Module):
+    wcfg = cfg.get("wandb", {})
+    if not wcfg.get("enabled", True):
+        print("W&B logging disabled by config.")
+        return None
+
+    tcfg = cfg["training"]
+    run = wandb.init(
+        project=wcfg.get("project", "COM304_nano4M"),
+        entity=wcfg.get("entity", None),
+        mode=wcfg.get("mode", "online"),
+        name=run_name,
+        group=wcfg.get("group", None),
+        tags=wcfg.get("tags", []),
+        notes=wcfg.get("notes", None),
+        config={
+            "seed": seed,
+            "run_name": run_name,
+            "data": cfg["data"],
+            "model": cfg["model"],
+            "training": tcfg,
+        },
+    )
+
+    wandb.define_metric("step")
+    wandb.define_metric("*", step_metric="step")
+
+    if wcfg.get("watch_model", False):
+        wandb.watch(
+            model,
+            log=wcfg.get("watch_log", "gradients"),
+            log_freq=wcfg.get("watch_log_freq", tcfg["log_every"]),
+        )
+
+    if wandb.run is not None:
+        print(f"W&B run: {wandb.run.url}")
+
+    return run
+
+
 def train(cfg: dict, seed: int, run_name: str):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device} | Seed: {seed} | Run: {run_name}")
@@ -90,20 +130,7 @@ def train(cfg: dict, seed: int, run_name: str):
     print(f"Params: {model.get_num_params() / 1e6:.1f}M")
 
     tcfg = cfg["training"]
-    wcfg = cfg.get("wandb", {})
-
-    # Init Wandb
-    wandb.init(
-        project=wcfg.get("project", "COM304_nano4M"),
-        entity=wcfg.get("entity", None),
-        name=run_name,
-        config={
-            "seed": seed,
-            "run_name": run_name,
-            **cfg["model"],
-            **tcfg,
-        },
-    )
+    wandb_run = init_wandb(cfg, seed, run_name, model)
 
     optimizer = optim.AdamW(
         model.parameters(), lr=tcfg["lr"], weight_decay=tcfg["weight_decay"]
@@ -151,8 +178,8 @@ def train(cfg: dict, seed: int, run_name: str):
                 **{f"val/{k}": v.item() for k, v in val_modality_losses.items()},
             }
 
-            # Log to Wandb
-            wandb.log(log, step=step)
+            if wandb_run is not None:
+                wandb.log(log)
 
             print(
                 f"[{step:>6}] train={loss.item():.4f} val={val_loss.item():.4f} "
@@ -166,7 +193,9 @@ def train(cfg: dict, seed: int, run_name: str):
             torch.save(model.state_dict(), ckpt_path)
             print(f"  → Checkpoint saved: {ckpt_path}")
 
-    wandb.finish()
+    if wandb_run is not None:
+        wandb.summary["final_step"] = tcfg["num_steps"]
+        wandb.finish()
     print(f"Training done. Logs: {log_path}")
 
 

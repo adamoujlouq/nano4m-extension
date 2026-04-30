@@ -33,5 +33,9 @@ data:
   text_max_length: 256
 
 wandb:
+  enabled: true
+  mode: online
   project: COM304_nano4M
   entity: adam-oujlouq
+  tags: ["rope", "week2"]
+  watch_model: false

@@ -18,9 +18,9 @@ def load_metrics(path):
     return steps, train_loss, val_loss, val_rgb, val_depth, val_normal, val_caption
 
 runs = {
-    "baseline_seed42":  "results/results/baseline_seed42/metrics.jsonl",
-    "baseline_seed123": "results/results/baseline_seed123/metrics.jsonl",
-    "swiglu_seed42":    "results/results/swiglu_seed42/metrics.jsonl",
+    "baseline_seed42":  "results/baseline_seed42_clean.jsonl",
+    "baseline_seed123": "results/baseline_seed123_metrics.jsonl",
+    "swiglu_seed42":    "results/swiglu_seed42_metrics.jsonl",
 }
 
 colors = {
@@ -38,16 +38,18 @@ for run_name, path in runs.items():
         continue
     steps, train_loss, val_loss, val_rgb, val_depth, val_normal, val_caption = load_metrics(path)
     c = colors[run_name]
-
-    # Plot 1 — Val loss globale
     axes[0].plot(steps, val_loss, label=run_name, color=c)
 
-    # Plot 2 — Val loss par modalité (seulement pour le premier run disponible)
-    if run_name == "baseline_seed123":
-        axes[1].plot(steps, val_rgb,     label="RGB",     color="steelblue")
-        axes[1].plot(steps, val_depth,   label="Depth",   color="tomato")
-        axes[1].plot(steps, val_normal,  label="Normals", color="seagreen")
-        axes[1].plot(steps, val_caption, label="Captions",color="darkorange")
+# Plot 2 — Val loss par modalité pour tous les runs
+for run_name, path in runs.items():
+    if not os.path.exists(path):
+        continue
+    steps, _, _, val_rgb, val_depth, val_normal, val_caption = load_metrics(path)
+    c = colors[run_name]
+    axes[1].plot(steps, val_rgb,     label=f"RGB ({run_name})",     color=c, linestyle="-")
+    axes[1].plot(steps, val_depth,   label=f"Depth ({run_name})",   color=c, linestyle="--")
+    axes[1].plot(steps, val_normal,  label=f"Normals ({run_name})", color=c, linestyle="-.")
+    axes[1].plot(steps, val_caption, label=f"Captions ({run_name})",color=c, linestyle=":")
 
 axes[0].set_title("Val Loss globale")
 axes[0].set_xlabel("Steps")
@@ -55,10 +57,10 @@ axes[0].set_ylabel("Loss")
 axes[0].legend()
 axes[0].grid(True, alpha=0.3)
 
-axes[1].set_title("Val Loss par modalité (baseline_seed123)")
+axes[1].set_title("Val Loss par modalité")
 axes[1].set_xlabel("Steps")
 axes[1].set_ylabel("Loss")
-axes[1].legend()
+axes[1].legend(fontsize=7)
 axes[1].grid(True, alpha=0.3)
 
 plt.tight_layout()

@@ -7,6 +7,8 @@ Implemented variants:
 - `configs/baseline.yaml`: original nano4M baseline.
 - `configs/swiglu.yaml`: week 1 variant, replacing the GELU MLP by SwiGLU.
 - `configs/rope.yaml`: week 2 variant, adding RoPE to encoder and decoder self-attention only.
+- `configs/qknorm.yaml`: week 3 variant, adding QK-Norm to self-attention and cross-attention.
+- `configs/all.yaml`: combined variant with SwiGLU, RoPE, and QK-Norm.
 
 ## Setup
 
@@ -72,6 +74,33 @@ The training script writes checkpoints and JSONL metrics under:
 results/<run_name>/
 ```
 
+## Week 3: QK-Norm run
+
+QK-Norm is controlled by:
+
+```yaml
+model:
+  use_qk_norm: true
+```
+
+Manual training command without W&B:
+
+```bash
+python train.py --config configs/qknorm.yaml --seed 42 --run_name qknorm_seed42
+```
+
+## Combined run
+
+The combined config enables all three architecture changes and keeps W&B disabled:
+
+```bash
+python train.py --config configs/all.yaml --seed 42 --run_name swiglu_rope_qknorm_seed42
+```
+
 ## Notes on the RoPE implementation
 
 RoPE is applied only inside self-attention layers, to the query/key tensors of the encoder and decoder. Cross-attention is left non-rotary, and it still receives the existing sinusoidal position embeddings so decoder target positions and encoder token positions remain visible to the cross-modal prediction path.
+
+## Notes on the QK-Norm implementation
+
+QK-Norm applies a learned per-head LayerNorm to the query and key tensors before the attention dot product. It is enabled for encoder self-attention, decoder self-attention, and encoder-decoder cross-attention.

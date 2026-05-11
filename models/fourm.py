@@ -57,6 +57,7 @@ class FourM(nn.Module):
         use_swiglu: If True, replace GELU MLP blocks with SwiGLU blocks.
         use_rope: If True, use RoPE in encoder/decoder self-attention only.
         rope_base: Base frequency used by RoPE.
+        use_qk_norm: If True, normalize attention queries and keys before the dot product.
         enc_depth: Number of Transformer encoder layers
         dec_depth: Number of Transformer decoder layers
         head_dim: Dimension of each attention head
@@ -84,6 +85,7 @@ class FourM(nn.Module):
         use_swiglu: bool = False,
         use_rope: bool = False,
         rope_base: float = 10000.0,
+        use_qk_norm: bool = False,
         enc_depth: int = 8,
         dec_depth: int = 8,
         head_dim: int = 64,
@@ -133,6 +135,7 @@ class FourM(nn.Module):
             use_swiglu=use_swiglu,
             use_rope=use_rope,
             rope_base=rope_base,
+            use_qk_norm=use_qk_norm,
         )
         self.decoder = TransformerDecoderTrunk(
             dim=dim,
@@ -143,6 +146,7 @@ class FourM(nn.Module):
             use_swiglu=use_swiglu,
             use_rope=use_rope,
             rope_base=rope_base,
+            use_qk_norm=use_qk_norm,
         )
 
         # Initialize encoder -> decoder context projection

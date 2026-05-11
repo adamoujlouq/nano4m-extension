@@ -70,6 +70,23 @@ class LayerNorm(nn.Module):
         return nn.functional.layer_norm(x, self.normalized_shape, self.weight, self.bias, eps=self.eps)
 
 
+class PerHeadLayerNorm(nn.Module):
+    """LayerNorm over head_dim with separate affine parameters for each attention head."""
+    def __init__(self, num_heads: int, head_dim: int, eps: float = 1e-6, bias: bool = False):
+        super().__init__()
+        self.eps = eps
+        self.normalized_shape = (head_dim,)
+        self.weight = nn.Parameter(torch.ones(num_heads, head_dim))
+        if bias:
+            self.bias = nn.Parameter(torch.zeros(num_heads, head_dim))
+        else:
+            self.register_buffer("bias", torch.zeros(num_heads, head_dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = F.layer_norm(x, self.normalized_shape, eps=self.eps)
+        return x * self.weight[None, :, None, :] + self.bias[None, :, None, :]
+
+
 class Mlp(nn.Module):
     """
     MLP module with GELU activation.
@@ -153,15 +170,20 @@ class Attention(nn.Module):
             proj_bias: bool = False,
             use_rope: bool = False,
             rope_base: float = 10000.0,
+            use_qk_norm: bool = False,
         ):
         super().__init__()
         self.num_heads = dim // head_dim
         self.scale = head_dim ** -0.5
         self.use_rope = use_rope
         self.rope_base = rope_base
+        self.use_qk_norm = use_qk_norm
 
         # Single projection for Q, K, V (3x the dimension)
         self.qkv = nn.Linear(dim, 3 * dim, bias=qkv_bias)
+        if use_qk_norm:
+            self.q_norm = PerHeadLayerNorm(self.num_heads, head_dim, bias=qkv_bias)
+            self.k_norm = PerHeadLayerNorm(self.num_heads, head_dim, bias=qkv_bias)
 
         self.attn_out_proj = nn.Linear(dim, dim, bias=proj_bias)
 
@@ -177,6 +199,10 @@ class Attention(nn.Module):
         qkv = self.qkv(x)  # [B, L, 3*D]
         qkv = rearrange(qkv, "b l (three h d) -> three b h l d", three=3, h=self.num_heads)
         q, k, v = qkv.unbind(0)  # Each: [B, num_heads, L, head_dim]
+
+        if self.use_qk_norm:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
 
         if self.use_rope:
             if positions is None:
@@ -211,16 +237,27 @@ class CrossAttention(nn.Module):
         qkv_bias: Whether to include bias in the QKV linear layers
         proj_bias: Whether to include bias in the attention output projection
     """
-    def __init__(self, dim: int, head_dim: int = 64, qkv_bias: bool = False, proj_bias: bool = False):
+    def __init__(
+            self,
+            dim: int,
+            head_dim: int = 64,
+            qkv_bias: bool = False,
+            proj_bias: bool = False,
+            use_qk_norm: bool = False,
+        ):
         super().__init__()
         self.num_heads = dim // head_dim
         self.scale = head_dim ** -0.5
+        self.use_qk_norm = use_qk_norm
 
         # Q from input x
         self.q = nn.Linear(dim, dim, bias=qkv_bias)
 
         # K and V from context (single projection for both)
         self.kv = nn.Linear(dim, 2 * dim, bias=qkv_bias)
+        if use_qk_norm:
+            self.q_norm = PerHeadLayerNorm(self.num_heads, head_dim, bias=qkv_bias)
+            self.k_norm = PerHeadLayerNorm(self.num_heads, head_dim, bias=qkv_bias)
 
         self.attn_out_proj = nn.Linear(dim, dim, bias=proj_bias)
 
@@ -236,6 +273,10 @@ class CrossAttention(nn.Module):
         kv = self.kv(context)  # [B, M, 2*D]
         kv = rearrange(kv, "b m (two h d) -> two b h m d", two=2, h=self.num_heads)
         k, v = kv.unbind(0)  # Each: [B, num_heads, M, head_dim]
+
+        if self.use_qk_norm:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
 
         # Attention matrix: [B, num_heads, N, M]
         attn = (q @ k.transpose(-2, -1)) * self.scale
@@ -277,6 +318,7 @@ class Block(nn.Module):
             use_swiglu: bool = False,
             use_rope: bool = False,
             rope_base: float = 10000.0,
+            use_qk_norm: bool = False,
         ):
         super().__init__()
         self.norm1 = LayerNorm(dim, bias=use_bias)
@@ -287,6 +329,7 @@ class Block(nn.Module):
             proj_bias=use_bias,
             use_rope=use_rope,
             rope_base=rope_base,
+            use_qk_norm=use_qk_norm,
         )
         self.norm2 = LayerNorm(dim, bias=use_bias)
         # Scale hidden dim by 2/3 for SwiGLU to keep param count ~equal (two input projections vs one)
@@ -327,6 +370,7 @@ class DecoderBlock(nn.Module):
             use_swiglu: bool = False,
             use_rope: bool = False,
             rope_base: float = 10000.0,
+            use_qk_norm: bool = False,
         ):
         super().__init__()
         self.norm1 = LayerNorm(dim, bias=use_bias)
@@ -341,8 +385,15 @@ class DecoderBlock(nn.Module):
             proj_bias=use_bias,
             use_rope=use_rope,
             rope_base=rope_base,
+            use_qk_norm=use_qk_norm,
         )
-        self.cross_attn = CrossAttention(dim, head_dim=head_dim, qkv_bias=use_bias, proj_bias=use_bias)
+        self.cross_attn = CrossAttention(
+            dim,
+            head_dim=head_dim,
+            qkv_bias=use_bias,
+            proj_bias=use_bias,
+            use_qk_norm=use_qk_norm,
+        )
 
         # Scale hidden dim by 2/3 for SwiGLU to keep param count ~equal (two input projections vs one)
         mlp_hidden_dim = int(dim * mlp_ratio * (2 / 3 if use_swiglu else 1))
@@ -392,6 +443,7 @@ class TransformerTrunk(nn.Module):
             use_swiglu: bool = False,
             use_rope: bool = False,
             rope_base: float = 10000.0,
+            use_qk_norm: bool = False,
         ):
         super().__init__()
 
@@ -404,6 +456,7 @@ class TransformerTrunk(nn.Module):
                 use_swiglu=use_swiglu,
                 use_rope=use_rope,
                 rope_base=rope_base,
+                use_qk_norm=use_qk_norm,
             )
             for _ in range(depth)
         ])
@@ -441,6 +494,7 @@ class TransformerDecoderTrunk(nn.Module):
             use_swiglu: bool = False,
             use_rope: bool = False,
             rope_base: float = 10000.0,
+            use_qk_norm: bool = False,
         ):
         super().__init__()
 
@@ -453,6 +507,7 @@ class TransformerDecoderTrunk(nn.Module):
                 use_swiglu=use_swiglu,
                 use_rope=use_rope,
                 rope_base=rope_base,
+                use_qk_norm=use_qk_norm,
             )
             for _ in range(depth)
         ])

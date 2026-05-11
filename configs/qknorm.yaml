@@ -5,9 +5,8 @@ model:
   head_dim: 64
   mlp_ratio: 4.0
   use_bias: false
-  use_swiglu: true
-  use_rope: true
-  rope_base: 10000.0
+  use_swiglu: false
+  use_rope: false
   use_qk_norm: true
 
 training:

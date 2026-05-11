@@ -8,7 +8,11 @@ import numpy as np
 import torch
 import torch.optim as optim
 import yaml
-import wandb
+
+try:
+    import wandb
+except ImportError:
+    wandb = None
 
 from data.multimodal import create_multimodal_masked_dataloader
 
@@ -86,6 +90,8 @@ def init_wandb(cfg: dict, seed: int, run_name: str, model: torch.nn.Module):
     if not wcfg.get("enabled", True):
         print("W&B logging disabled by config.")
         return None
+    if wandb is None:
+        raise ImportError("W&B logging is enabled, but wandb is not installed. Install wandb or set wandb.enabled: false.")
 
     tcfg = cfg["training"]
     run = wandb.init(

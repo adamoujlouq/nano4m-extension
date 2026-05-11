@@ -1,0 +1,36 @@
+model:
+  dim: 512
+  enc_depth: 6
+  dec_depth: 6
+  head_dim: 64
+  mlp_ratio: 4.0
+  use_bias: false
+  use_swiglu: true
+  use_rope: true
+  rope_base: 10000.0
+
+training:
+  lr: 3.0e-4
+  weight_decay: 0.05
+  batch_size: 64
+  num_steps: 10000
+  warmup_steps: 500
+  grad_clip: 1.0
+  log_every: 100
+  save_every: 1000
+
+data:
+  root_dir: /work/com-304/datasets/clevr_com_304/
+  modalities: ["tok_rgb@256", "tok_depth@256", "tok_normal@256", "scene_desc"]
+  vocab_sizes: [64000, 64000, 64000, 50304]
+  max_seq_lens: [256, 256, 256, 256]
+  input_alphas: [1.0, 1.0, 1.0, 1.0]
+  target_alphas: [1.0, 1.0, 1.0, 1.0]
+  input_tokens_range: [1, 128]
+  target_tokens_range: [1, 128]
+  sample_from_k_augmentations: 10
+  text_tokenizer_path: gpt2
+  text_max_length: 256
+
+wandb:
+  enabled: false
